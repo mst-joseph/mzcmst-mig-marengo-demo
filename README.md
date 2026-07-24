@@ -96,7 +96,6 @@ export PROFILE=mzcmst
 
 ### 2.1 로컬에서 빌드
 ```bash
-cd /Users/joseph/Desktop/01_Project/mzc/26-04-AI_Migration/ai-migration-demo
 make build
 ```
 
