@@ -203,7 +203,7 @@ Resources:
 
   # ----------------------------------------------------------------------------
   #  Resource : MediaIndex  (AWS::S3Vectors::Index)
-  #  Purpose  : 영상/이미지 segment 임베딩 인덱스 (dim=1024, cosine, float32)
+  #  Purpose  : 영상/이미지 segment 임베딩 인덱스 (dim=512, cosine, float32)
   #  Metadata : file_path, media_type, segment_start, segment_end, duration_sec, resolution, codec, checksum
   # ----------------------------------------------------------------------------
   MediaIndex:

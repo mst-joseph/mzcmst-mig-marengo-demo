@@ -1,7 +1,7 @@
 [
   { "ParameterKey": "ProjectName",             "ParameterValue": "ai-migration-poc" },
   { "ParameterKey": "BedrockModelId",          "ParameterValue": "twelvelabs.marengo-embed-3-0-v1:0" },
-  { "ParameterKey": "VectorDimension",         "ParameterValue": "1024" },
+  { "ParameterKey": "VectorDimension",         "ParameterValue": "512" },
   { "ParameterKey": "LandingBucketName",       "ParameterValue": "" },
   { "ParameterKey": "EnableEventBridge",       "ParameterValue": "true" },
   { "ParameterKey": "LogRetentionDays",        "ParameterValue": "14" },
