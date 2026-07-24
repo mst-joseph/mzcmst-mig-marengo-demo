@@ -1,0 +1,2 @@
+# Lambda runtime ships boto3; pin a recent version for s3vectors + bedrock-runtime async APIs.
+boto3>=1.35.0

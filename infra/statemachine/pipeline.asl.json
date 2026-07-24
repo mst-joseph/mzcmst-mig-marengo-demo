@@ -1,0 +1,264 @@
+{
+  "Comment": "AI Migration PoC pipeline — Validate -> ExtractMetadata -> StartEmbed -> Wait+Poll loop -> IndexVectors -> UpdateStatus. Placeholders ${VarName} resolved by CFN DefinitionSubstitutions.",
+  "StartAt": "ValidateMedia",
+  "States": {
+    "ValidateMedia": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateMediaFnArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "validation.$": "$.Payload"
+      },
+      "ResultPath": "$.validateResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "ExtractMetadata"
+    },
+
+    "ExtractMetadata": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ExtractMetadataFnArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "metadata.$": "$.Payload"
+      },
+      "ResultPath": "$.metadataResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "StartEmbed"
+    },
+
+    "StartEmbed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StartEmbedFnArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "invocationArn.$": "$.Payload.invocationArn",
+        "outputS3Uri.$": "$.Payload.outputS3Uri"
+      },
+      "ResultPath": "$.embed",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Bedrock.ThrottlingException"],
+          "IntervalSeconds": 5,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        },
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "InitPollCounter"
+    },
+
+    "InitPollCounter": {
+      "Type": "Pass",
+      "Result": 0,
+      "ResultPath": "$.embed.pollCount",
+      "Next": "WaitForEmbed"
+    },
+
+    "WaitForEmbed": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "PollEmbed"
+    },
+
+    "PollEmbed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PollEmbedFnArn}",
+        "Payload": {
+          "invocationArn.$": "$.embed.invocationArn",
+          "outputS3Uri.$": "$.embed.outputS3Uri",
+          "pollCount.$": "$.embed.pollCount"
+        }
+      },
+      "ResultSelector": {
+        "status.$": "$.Payload.status",
+        "pollCount.$": "$.Payload.pollCount",
+        "outputS3Uri.$": "$.Payload.outputS3Uri"
+      },
+      "ResultPath": "$.embed",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "EmbedStatusChoice"
+    },
+
+    "EmbedStatusChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.embed.status",
+          "StringEquals": "Completed",
+          "Next": "IndexVectors"
+        },
+        {
+          "Variable": "$.embed.status",
+          "StringEquals": "Failed",
+          "Next": "MarkFailed"
+        },
+        {
+          "Variable": "$.embed.pollCount",
+          "NumericGreaterThanEquals": 40,
+          "Next": "MarkTimedOut"
+        }
+      ],
+      "Default": "WaitForEmbed"
+    },
+
+    "IndexVectors": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${IndexVectorsFnArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "indexed.$": "$.Payload.indexed"
+      },
+      "ResultPath": "$.indexResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "BackoffRate": 2,
+          "MaxAttempts": 5
+        },
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "MarkSuccess"
+    },
+
+    "MarkSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${StatusTableName}",
+        "Key": {
+          "file_id": { "S.$": "$.file_id" },
+          "version": { "S": "v1" }
+        },
+        "UpdateExpression": "SET #s = :s, updated_at = :u, indexed_count = :c",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "SUCCESS" },
+          ":u": { "S.$": "$$.State.EnteredTime" },
+          ":c": { "N.$": "States.JsonToString($.indexResult.indexed)" }
+        }
+      },
+      "End": true
+    },
+
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${StatusTableName}",
+        "Key": {
+          "file_id": { "S.$": "$.file_id" },
+          "version": { "S": "v1" }
+        },
+        "UpdateExpression": "SET #s = :s, updated_at = :u, failure_reason = :r",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "FAILED" },
+          ":u": { "S.$": "$$.State.EnteredTime" },
+          ":r": { "S.$": "States.JsonToString($.error)" }
+        }
+      },
+      "End": true
+    },
+
+    "MarkTimedOut": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${StatusTableName}",
+        "Key": {
+          "file_id": { "S.$": "$.file_id" },
+          "version": { "S": "v1" }
+        },
+        "UpdateExpression": "SET #s = :s, updated_at = :u, failure_reason = :r",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "FAILED" },
+          ":u": { "S.$": "$$.State.EnteredTime" },
+          ":r": { "S": "Embed polling exceeded 40 attempts (~10 minutes)" }
+        }
+      },
+      "End": true
+    }
+  }
+}

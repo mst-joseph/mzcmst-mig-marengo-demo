@@ -1,0 +1,1445 @@
+# ==============================================================================================================================
+#      File     : infra/template.yaml
+#      Project  : MZCMST AI Migration PoC
+#      Description: 메인 CloudFormation 템플릿 — S3/Lambda/SFN/S3 Vectors/DynamoDB/API GW 일괄 생성
+#      Author   : Joseph Kim <josephkim@mz.co.kr>
+#      Date     : 2026-05-11
+#      Branch   : feature/ai-mig-poc-infra
+#      Usage    : make deploy STACK=ai-mig-poc
+#      Notes    : 문의 — Media Service Team(mzc_tm_mediaserv@megazone.com).
+#
+#      Copyright 2026. MEGAZONE CLOUD Corp. All rights reserved.
+#      This file is part of the Professional Offering Services of Megazone Cloud Media Services Team.
+# ==============================================================================================================================
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AI Migration PoC - single-stack baseline.
+  S3 Landing + S3 Vectors + DynamoDB + SQS + Lambda(7) + Step Functions + API Gateway.
+  All taggable resources receive 4 standard tags: Application/Name/Service/Team.
+
+# ------------------------------------------------------------------------------
+#  Parameters — 배포 시 사용자 입력 (Makefile --parameter-overrides 로 주입)
+# ------------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ai-migration-poc
+    Description: Prefix for all resource names and base for the Name tag. Lowercase/digits/hyphen, 3-33 chars.
+    AllowedPattern: ^[a-z][a-z0-9-]{2,32}$
+    ConstraintDescription: Must start with lowercase letter; only lowercase, digits, hyphens; 3-33 chars.
+
+  BedrockModelId:
+    Type: String
+    Default: twelvelabs.marengo-embed-3-0-v1:0
+    Description: Bedrock Marengo base modelId. Inference profile prefix (apac.*) is NOT supported.
+    AllowedPattern: ^twelvelabs\..+
+    ConstraintDescription: Must start with 'twelvelabs.' (base modelId only).
+
+  VectorDimension:
+    Type: Number
+    Default: 512
+    MinValue: 1
+    MaxValue: 4096
+    Description: S3 Vectors index dimension. Marengo 3.0 = 512 (reduced from 1024 in 2.7).
+
+  LandingBucketName:
+    Type: String
+    Default: ''
+    Description: Leave empty to auto-name as ${ProjectName}-landing-${Account}-${Region}.
+
+  EnableEventBridge:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Auto-trigger SQS on S3 raw/ ObjectCreated events. on/off.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 7, 14, 30, 60, 90]
+    Description: CloudWatch Logs retention period (days).
+
+  EmbedSegmentDurationSec:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 60
+    Description: Marengo video segmentation fixed duration (seconds).
+
+  SearchTopKMax:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 100
+    Description: Maximum topK value allowed by the /search API.
+
+Conditions:
+  UseAutoLandingBucketName: !Equals [!Ref LandingBucketName, '']
+  EnableEventBridgeCond: !Equals [!Ref EnableEventBridge, 'true']
+
+# ------------------------------------------------------------------------------
+#  Resources — 그룹: Storage / State / IAM / Compute / Orchestration / API
+#  Tag policy (every taggable resource):
+#    Application=MediaMig (fixed)
+#    Name=${ProjectName}-<purpose>
+#    Service=<AWS service short name>
+#    Team=MZCMST (fixed)
+# ------------------------------------------------------------------------------
+Resources:
+
+  # ============================================================================
+  #  GROUP A — STORAGE
+  # ============================================================================
+
+  # ----------------------------------------------------------------------------
+  #  Resource : LandingBucket  (AWS::S3::Bucket)
+  #  Purpose  : 원본 미디어 도착 지점. prefix — raw/, pending/, embeddings/, processed/
+  #  Trigger  : ObjectCreated:Put on raw/ → IngestQueue
+  #  Owner    : (담당자)  |  Service Team : Media Service Team
+  #  Notes    : SSE-S3, versioning off (PoC 한정). 이벤트는 raw/ prefix 로만 한정 (루프 방지).
+  # ----------------------------------------------------------------------------
+  LandingBucket:
+    Type: AWS::S3::Bucket
+    # Explicit DependsOn — S3 validates the SQS destination at bucket-create time
+    # and needs the QueuePolicy (S3 -> SQS sqs:SendMessage) already attached.
+    # Without this, creation fails with "Unable to validate destination configurations".
+    DependsOn: IngestQueuePolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !If
+        - UseAutoLandingBucketName
+        - !Sub ${ProjectName}-landing-${AWS::AccountId}-${AWS::Region}
+        - !Ref LandingBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended
+      NotificationConfiguration: !If
+        - EnableEventBridgeCond
+        # s3:ObjectCreated:* — Put + Post + Copy + CompleteMultipartUpload 모두 캡처.
+        # 영상은 수십 MB 이상이라 콘솔/CLI 가 자동 멀티파트 업로드로 전환되며,
+        # 'Put' 단독 필터는 그 이벤트를 못 잡는다.
+        - QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Queue: !GetAtt IngestQueue.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: raw/
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-landing
+        - Key: Service
+          Value: S3
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : LandingBucketPolicy  (AWS::S3::BucketPolicy)
+  #  Purpose  : SQS 가 S3 이벤트 알림을 수신할 수 있도록 동일 계정 한정 정책 부여
+  # ----------------------------------------------------------------------------
+  LandingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LandingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt LandingBucket.Arn
+              - !Sub ${LandingBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: AllowSameAccountOnly
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt LandingBucket.Arn
+              - !Sub ${LandingBucket.Arn}/*
+
+  # ----------------------------------------------------------------------------
+  #  Resource : VectorBucket  (AWS::S3Vectors::VectorBucket)  [NATIVE 시도]
+  #  Purpose  : 시맨틱 검색용 벡터 저장소. 실패 시 Custom Resource 로 대체.
+  #  Notes    : 2025.12 GA. Tags 지원 여부는 배포 시 확인.
+  # ----------------------------------------------------------------------------
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VectorBucketName: !Sub ${ProjectName}-vectors
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-vectors
+        - Key: Service
+          Value: S3Vectors
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : MediaIndex  (AWS::S3Vectors::Index)
+  #  Purpose  : 영상/이미지 segment 임베딩 인덱스 (dim=1024, cosine, float32)
+  #  Metadata : file_path, media_type, segment_start, segment_end, duration_sec, resolution, codec, checksum
+  # ----------------------------------------------------------------------------
+  MediaIndex:
+    Type: AWS::S3Vectors::Index
+    DependsOn: VectorBucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # NOTE: Avoid !Ref VectorBucket here. For AWS::S3Vectors::VectorBucket,
+      # Ref returns the ARN (~77 chars), exceeding VectorBucketName maxLength=63.
+      # Use the deterministic Sub form that matches VectorBucket.Properties.VectorBucketName.
+      VectorBucketName: !Sub ${ProjectName}-vectors
+      IndexName: media-index
+      DataType: float32
+      Dimension: !Ref VectorDimension
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - checksum
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-media-index
+        - Key: Service
+          Value: S3Vectors
+        - Key: Team
+          Value: MZCMST
+
+  # ============================================================================
+  #  GROUP B — STATE (DynamoDB + SQS)
+  # ============================================================================
+
+  # ----------------------------------------------------------------------------
+  #  Resource : StatusTable  (AWS::DynamoDB::Table)
+  #  Purpose  : 파일별 처리 상태 추적 — file_id × version. GSI: status-updated_at-index
+  #  Billing  : On-Demand (PAY_PER_REQUEST)
+  # ----------------------------------------------------------------------------
+  StatusTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub ${ProjectName}-status
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: file_id
+          AttributeType: S
+        - AttributeName: version
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: updated_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: file_id
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: status-updated_at-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: updated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-status
+        - Key: Service
+          Value: DynamoDB
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : IngestDLQ  (AWS::SQS::Queue)
+  #  Purpose  : Dispatcher 처리 실패 메시지 격리 — TTL 14일
+  # ----------------------------------------------------------------------------
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub ${ProjectName}-ingest-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-ingest-dlq
+        - Key: Service
+          Value: SQS
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : IngestQueue  (AWS::SQS::Queue)
+  #  Purpose  : S3 raw/ ObjectCreated 이벤트 버퍼. DispatcherFn 의 event source.
+  #  Notes    : visibilityTimeout=90s, maxReceive=3 → DLQ
+  # ----------------------------------------------------------------------------
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub ${ProjectName}-ingest
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-ingest
+        - Key: Service
+          Value: SQS
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : IngestQueuePolicy  (AWS::SQS::QueuePolicy)
+  #  Purpose  : S3 LandingBucket 이 IngestQueue 에 메시지를 보낼 수 있도록 허용
+  # ----------------------------------------------------------------------------
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # NOTE (PoC scope): No SourceArn/SourceAccount Conditions.
+          # Reason: S3 sends a real s3:TestEvent during bucket creation, and a too-strict
+          # Condition (exact SourceArn match) is racy against the bucket name resolution,
+          # leading to "Unable to validate destination configurations" errors.
+          # In production, re-add: ArnLike aws:SourceArn arn:aws:s3:::${ProjectName}-landing-*
+          # and StringEquals aws:SourceAccount ${AWS::AccountId}.
+          - Sid: AllowS3SendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+
+  # ============================================================================
+  #  GROUP C — IAM (Lambda 별 역할 분리 — 최소 권한)
+  # ============================================================================
+
+  # ----------------------------------------------------------------------------
+  #  Resource : DispatcherFnRole  (AWS::IAM::Role)
+  #  Purpose  : SQS poll + DDB Put/Update + SFN StartExecution
+  # ----------------------------------------------------------------------------
+  DispatcherFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-dispatcher-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dispatcher-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt StatusTable.Arn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-pipeline
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-dispatcher-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : ValidateMediaFnRole  (AWS::IAM::Role)
+  #  Purpose  : S3 HeadObject(raw/*) + DDB Update
+  # ----------------------------------------------------------------------------
+  ValidateMediaFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-validate-media-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: validate-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:HeadObject
+                  - s3:GetObject
+                Resource: !Sub ${LandingBucket.Arn}/raw/*
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt StatusTable.Arn
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-validate-media-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : ExtractMetadataFnRole  (AWS::IAM::Role)
+  #  Purpose  : S3 GetObject(raw/*) + DDB Update (ffprobe layer 사용)
+  # ----------------------------------------------------------------------------
+  ExtractMetadataFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-extract-metadata-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: extract-metadata-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${LandingBucket.Arn}/raw/*
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt StatusTable.Arn
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-extract-metadata-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : StartEmbedFnRole  (AWS::IAM::Role)
+  #  Purpose  : Bedrock StartAsyncInvoke + S3 Read(raw/*) + S3 Write(embeddings/*)
+  # ----------------------------------------------------------------------------
+  StartEmbedFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-start-embed-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-embed-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Bedrock async invoke 는 SDK 메소드명이 StartAsyncInvoke 지만 IAM 액션으로는
+              # 존재하지 않는다. 실제 검사 액션은 bedrock:InvokeModel 이며,
+              # 비동기 호출 시 검사 리소스는 foundation-model/* 와 async-invoke/* 둘 다 필요하다.
+              # (StartAsyncInvoke / GetAsyncInvoke 는 SDK 메소드 이름 — IAM 액션 아님)
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
+              # TwelveLabs Marengo 는 AWS Marketplace 경유 모델이라 첫 invoke 시 구독 자동 처리.
+              # 호출자 role 에 marketplace 권한이 없으면 AccessDeniedException.
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:Unsubscribe
+                  - aws-marketplace:ViewSubscriptions
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${LandingBucket.Arn}/raw/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub ${LandingBucket.Arn}/embeddings/*
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt StatusTable.Arn
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-start-embed-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : PollEmbedFnRole  (AWS::IAM::Role)
+  #  Purpose  : Bedrock GetAsyncInvoke 폴링 전용 (read-only)
+  # ----------------------------------------------------------------------------
+  PollEmbedFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-poll-embed-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: poll-embed-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # GetAsyncInvoke 는 IAM 액션으로 실재 (read-only).
+              - Effect: Allow
+                Action: bedrock:GetAsyncInvoke
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-poll-embed-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : IndexVectorsFnRole  (AWS::IAM::Role)
+  #  Purpose  : S3 read(embeddings/*) + s3vectors:PutVectors + DDB Update
+  # ----------------------------------------------------------------------------
+  IndexVectorsFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-index-vectors-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: index-vectors-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${LandingBucket.Arn}/embeddings/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt LandingBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:GetIndex
+                Resource:
+                  - !Sub arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${ProjectName}-vectors
+                  - !Sub arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${ProjectName}-vectors/index/media-index
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt StatusTable.Arn
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-index-vectors-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : SearchHandlerFnRole  (AWS::IAM::Role)
+  #  Purpose  : Bedrock InvokeModel(text→vec) + s3vectors:QueryVectors
+  #             + DDB Query(상태 카운트) + S3 GetObject(thumb/playback presign)
+  # ----------------------------------------------------------------------------
+  SearchHandlerFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-search-handler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: search-handler-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+              # Marketplace 모델 호출 시 권한 검사 — start_embed 와 동일 이유.
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:Unsubscribe
+                  - aws-marketplace:ViewSubscriptions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3vectors:QueryVectors
+                  - s3vectors:GetVectors
+                Resource: !Sub arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${ProjectName}-vectors/index/media-index
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt StatusTable.Arn
+                  - !Sub ${StatusTable.Arn}/index/status-updated_at-index
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub ${LandingBucket.Arn}/raw/*
+                  - !Sub ${LandingBucket.Arn}/processed/*
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-search-handler-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : PipelineStateMachineRole  (AWS::IAM::Role)
+  #  Purpose  : Step Functions 실행 — Lambda invoke + CloudWatch Logs
+  # ----------------------------------------------------------------------------
+  PipelineStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-sfn-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-pipeline
+              # SFN ASL 의 MarkSuccess/MarkFailed/MarkTimedOut 이 직접 DDB UpdateItem 호출.
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt StatusTable.Arn
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-sfn-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : ApiGatewayCloudWatchRole  (AWS::IAM::Role)
+  #  Purpose  : API Gateway → CloudWatch Logs 권한 (계정 단위 한 번만 필요하나 stack-local 로 생성)
+  # ----------------------------------------------------------------------------
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-apigw-cw-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-apigw-cw-role
+        - Key: Service
+          Value: IAM
+        - Key: Team
+          Value: MZCMST
+
+  # ============================================================================
+  #  GROUP D — COMPUTE (Lambda 함수 7종 + LogGroup)
+  #  모든 함수: Python 3.12 / ARM64 / ZipFile placeholder.
+  #  실제 코드는 lambdas/<name>/handler.py 로 분리 — 1차 배포 후 코드 푸시 단계에서 갱신.
+  # ============================================================================
+
+  # ----------------------------------------------------------------------------
+  #  Resource : DispatcherFn  (AWS::Lambda::Function)
+  #  Purpose  : SQS 이벤트 수신 → DDB PUT(PENDING) → SFN StartExecution
+  #  Invoker  : IngestQueue (event source mapping)
+  # ----------------------------------------------------------------------------
+  DispatcherFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-dispatcher
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-dispatcher-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  DispatcherFn:
+    Type: AWS::Lambda::Function
+    DependsOn: DispatcherFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-dispatcher
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt DispatcherFnRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          STATUS_TABLE: !Ref StatusTable
+          STATE_MACHINE_ARN: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-pipeline
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          # placeholder — 실제 구현은 lambdas/dispatcher/handler.py 참고
+          def lambda_handler(event, context):
+              return {"ok": True, "stub": "dispatcher"}
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-dispatcher
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  DispatcherEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IngestQueue.Arn
+      FunctionName: !GetAtt DispatcherFn.Arn
+      BatchSize: 5
+      Enabled: true
+
+  # ----------------------------------------------------------------------------
+  #  Resource : ValidateMediaFn  (AWS::Lambda::Function)
+  #  Purpose  : SFN Task — mime/size/확장자 검증. fail-fast.
+  # ----------------------------------------------------------------------------
+  ValidateMediaFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-validate-media
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-validate-media-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  ValidateMediaFn:
+    Type: AWS::Lambda::Function
+    DependsOn: ValidateMediaFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-validate-media
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt ValidateMediaFnRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          STATUS_TABLE: !Ref StatusTable
+          LANDING_BUCKET: !Ref LandingBucket
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"ok": True, "stub": "validate-media", "input": event}
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-validate-media
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : ExtractMetadataFn  (AWS::Lambda::Function)
+  #  Purpose  : ffprobe (Lambda Layer) 로 duration/resolution/codec 추출 → DDB 업데이트
+  #  Notes    : FfprobeLayer 는 별도 배포 자산 — 1차 배포 후 layer attach 갱신
+  # ----------------------------------------------------------------------------
+  ExtractMetadataFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-extract-metadata
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-extract-metadata-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  ExtractMetadataFn:
+    Type: AWS::Lambda::Function
+    DependsOn: ExtractMetadataFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-extract-metadata
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt ExtractMetadataFnRole.Arn
+      MemorySize: 1024
+      Timeout: 60
+      Environment:
+        Variables:
+          STATUS_TABLE: !Ref StatusTable
+          LANDING_BUCKET: !Ref LandingBucket
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"ok": True, "stub": "extract-metadata", "input": event}
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-extract-metadata
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : StartEmbedFn  (AWS::Lambda::Function)
+  #  Purpose  : Bedrock StartAsyncInvoke — Marengo Embed 3.0 (base modelId 필수)
+  #  Notes    : inference profile prefix(apac.*) 미지원. embeddings/ 에 결과 저장.
+  # ----------------------------------------------------------------------------
+  StartEmbedFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-start-embed
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-start-embed-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  StartEmbedFn:
+    Type: AWS::Lambda::Function
+    DependsOn: StartEmbedFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-start-embed
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt StartEmbedFnRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          STATUS_TABLE: !Ref StatusTable
+          LANDING_BUCKET: !Ref LandingBucket
+          BUCKET_OWNER: !Ref AWS::AccountId
+          EMBED_SEGMENT_SEC: !Ref EmbedSegmentDurationSec
+          EMBED_OUTPUT_PREFIX: embeddings/
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"ok": True, "stub": "start-embed", "invocationArn": "arn:stub"}
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-start-embed
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : PollEmbedFn  (AWS::Lambda::Function)
+  #  Purpose  : SFN Wait+Poll loop — Bedrock GetAsyncInvoke 상태 조회
+  # ----------------------------------------------------------------------------
+  PollEmbedFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-poll-embed
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-poll-embed-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  PollEmbedFn:
+    Type: AWS::Lambda::Function
+    DependsOn: PollEmbedFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-poll-embed
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt PollEmbedFnRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"ok": True, "status": "InProgress", "stub": "poll-embed"}
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-poll-embed
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : IndexVectorsFn  (AWS::Lambda::Function)
+  #  Purpose  : Marengo 결과 JSON → s3vectors:PutVectors 배치(최대 1000건)
+  # ----------------------------------------------------------------------------
+  IndexVectorsFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-index-vectors
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-index-vectors-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  IndexVectorsFn:
+    Type: AWS::Lambda::Function
+    DependsOn: IndexVectorsFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-index-vectors
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt IndexVectorsFnRole.Arn
+      MemorySize: 512
+      Timeout: 60
+      Environment:
+        Variables:
+          STATUS_TABLE: !Ref StatusTable
+          LANDING_BUCKET: !Ref LandingBucket
+          VECTOR_BUCKET_NAME: !Sub ${ProjectName}-vectors
+          VECTOR_INDEX_NAME: media-index
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"ok": True, "stub": "index-vectors", "indexed": 0}
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-index-vectors
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : SearchHandlerFn  (AWS::Lambda::Function)
+  #  Purpose  : API /search — text→embed→query→presign 응답
+  #  Invoker  : API Gateway (proxy integration)
+  # ----------------------------------------------------------------------------
+  SearchHandlerFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-search-handler
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-search-handler-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  SearchHandlerFn:
+    Type: AWS::Lambda::Function
+    DependsOn: SearchHandlerFnLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-search-handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt SearchHandlerFnRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          VECTOR_BUCKET_NAME: !Sub ${ProjectName}-vectors
+          VECTOR_INDEX_NAME: media-index
+          STATUS_TABLE: !Ref StatusTable
+          LANDING_BUCKET: !Ref LandingBucket
+          TOP_K_MAX: !Ref SearchTopKMax
+          PRESIGN_TTL_SEC: '600'
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*"
+                  },
+                  "body": json.dumps({"ok": True, "stub": "search-handler", "results": []})
+              }
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-search-handler
+        - Key: Service
+          Value: Lambda
+        - Key: Team
+          Value: MZCMST
+
+  # ============================================================================
+  #  GROUP E — ORCHESTRATION (Step Functions)
+  # ============================================================================
+
+  # ----------------------------------------------------------------------------
+  #  Resource : PipelineStateMachineLogGroup
+  # ----------------------------------------------------------------------------
+  PipelineStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/states/${ProjectName}-pipeline
+      RetentionInDays: 90
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-pipeline-logs
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Resource : PipelineStateMachine  (AWS::StepFunctions::StateMachine)
+  #  Purpose  : Validate → Metadata → StartEmbed → Wait+Poll → Index → Update
+  #  Notes    : DefinitionString 은 Makefile 의 build-template 단계에서
+  #             infra/statemachine/pipeline.asl.json 파일 내용으로 치환됨.
+  #             ${VarName} 형태의 placeholder 는 DefinitionSubstitutions 가 처리.
+  # ----------------------------------------------------------------------------
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: PipelineStateMachineLogGroup
+    Properties:
+      StateMachineName: !Sub ${ProjectName}-pipeline
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt PipelineStateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        ValidateMediaFnArn: !GetAtt ValidateMediaFn.Arn
+        ExtractMetadataFnArn: !GetAtt ExtractMetadataFn.Arn
+        StartEmbedFnArn: !GetAtt StartEmbedFn.Arn
+        PollEmbedFnArn: !GetAtt PollEmbedFn.Arn
+        IndexVectorsFnArn: !GetAtt IndexVectorsFn.Arn
+        StatusTableName: !Ref StatusTable
+      DefinitionString: |
+        {
+          "Comment": "AI Migration PoC pipeline — placeholder. Real ASL injected by Makefile build step from infra/statemachine/pipeline.asl.json.",
+          "StartAt": "Stub",
+          "States": {
+            "Stub": {
+              "Type": "Pass",
+              "Result": "replace-with-real-asl",
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-pipeline
+        - Key: Service
+          Value: StepFunctions
+        - Key: Team
+          Value: MZCMST
+
+  # ============================================================================
+  #  GROUP F — API (API Gateway REST → SearchHandlerFn)
+  # ============================================================================
+
+  # ----------------------------------------------------------------------------
+  #  Resource : ApiGatewayAccount  (AWS::ApiGateway::Account)
+  #  Purpose  : 계정 단위 CW 로그 역할 설정 (한 번만 적용되면 충분)
+  # ----------------------------------------------------------------------------
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # ----------------------------------------------------------------------------
+  #  Resource : SearchApi  (AWS::ApiGateway::RestApi)
+  #  Purpose  : REST API — POST /search, GET /healthz. CORS=* (PoC 한정)
+  # ----------------------------------------------------------------------------
+  SearchApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-search-api
+      Description: AI Migration PoC - semantic video search API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-search-api
+        - Key: Service
+          Value: APIGateway
+        - Key: Team
+          Value: MZCMST
+
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SearchApi
+      ParentId: !GetAtt SearchApi.RootResourceId
+      PathPart: search
+
+  HealthzResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SearchApi
+      ParentId: !GetAtt SearchApi.RootResourceId
+      PathPart: healthz
+
+  SearchPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SearchApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchHandlerFn.Arn}/invocations
+
+  HealthzGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SearchApi
+      ResourceId: !Ref HealthzResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchHandlerFn.Arn}/invocations
+
+  # ----------------------------------------------------------------------------
+  #  CORS OPTIONS — Mock 통합 (preflight 응답)
+  # ----------------------------------------------------------------------------
+  SearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SearchApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  HealthzOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SearchApi
+      ResourceId: !Ref HealthzResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ----------------------------------------------------------------------------
+  #  Deployment + Stage  (prod)
+  # ----------------------------------------------------------------------------
+  SearchApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SearchPostMethod
+      - SearchOptionsMethod
+      - HealthzGetMethod
+      - HealthzOptionsMethod
+    Properties:
+      RestApiId: !Ref SearchApi
+
+  SearchApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref SearchApi
+      DeploymentId: !Ref SearchApiDeployment
+      StageName: prod
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 20
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+          MetricsEnabled: true
+      Tags:
+        - Key: Application
+          Value: MediaMig
+        - Key: Name
+          Value: !Sub ${ProjectName}-search-api-stage
+        - Key: Service
+          Value: APIGateway
+        - Key: Team
+          Value: MZCMST
+
+  # ----------------------------------------------------------------------------
+  #  Lambda invoke permission for API Gateway
+  # ----------------------------------------------------------------------------
+  SearchHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SearchHandlerFn.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SearchApi}/*/*
+
+# ==============================================================================
+#  Outputs
+# ==============================================================================
+Outputs:
+  LandingBucketName:
+    Description: Target S3 bucket for sample media uploads.
+    Value: !Ref LandingBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-LandingBucketName
+
+  StateMachineArn:
+    Description: Pipeline StateMachine ARN.
+    Value: !Ref PipelineStateMachine
+    Export:
+      Name: !Sub ${AWS::StackName}-StateMachineArn
+
+  SearchApiEndpoint:
+    Description: Use as NEXT_PUBLIC_API_BASE in the frontend .env.local file.
+    Value: !Sub https://${SearchApi}.execute-api.${AWS::Region}.amazonaws.com/${SearchApiStage}
+    Export:
+      Name: !Sub ${AWS::StackName}-SearchApiEndpoint
+
+  VectorIndexName:
+    Description: S3 Vectors index name.
+    Value: media-index
+    Export:
+      Name: !Sub ${AWS::StackName}-VectorIndexName
+
+  VectorBucketName:
+    Description: S3 Vectors bucket name.
+    Value: !Sub ${ProjectName}-vectors
+    Export:
+      Name: !Sub ${AWS::StackName}-VectorBucketName
+
+  StatusTableName:
+    Description: DynamoDB table that tracks processing status.
+    Value: !Ref StatusTable
+    Export:
+      Name: !Sub ${AWS::StackName}-StatusTableName
+
+  IngestQueueUrl:
+    Description: SQS queue URL (for operational debugging).
+    Value: !Ref IngestQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-IngestQueueUrl
